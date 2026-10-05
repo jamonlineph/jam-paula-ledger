@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
-import { currentUser, endSession, hashPassword, noteFailedAttempt, randomToken, requireUser, sha256, startSession, tooManyAttempts, verifyPassword, type AppEnv } from './auth';
-import { deleteWeek, getRows, getSettings, getWeek, getYear, HttpError, listWeeks, patchRows, putWeek, recomputeAll, saveSettings, saveYear, type Env } from './db';
+import { currentUser, endOtherSessions, endSession, hashPassword, noteFailedAttempt, randomToken, requireUser, sha256, startSession, tooManyAttempts, verifyPassword, type AppEnv } from './auth';
+import { deleteWeek, getAllRows, getRows, getRowsOf, getSettings, getWeek, getYear, HttpError, listWeeks, listYears, moveRefs, patchRows, patchYear, putWeek, recomputeAll, saveSettings, saveYear, versions, type Env } from './db';
+import { normalizeSettings, todayISO } from './core';
 import { handleMcp } from './mcp';
 import { askAI } from './ai';
 import { cronSheets, notionSyncWeek, pushSheets, sheetsState } from './sync';
@@ -56,16 +57,49 @@ app.post('/api/password', async c => {
   const u = await c.env.DB.prepare('SELECT pw_hash FROM users WHERE id = ?').bind(c.get('user').id).first<{ pw_hash: string }>();
   if (!u || !(await verifyPassword(current || '', u.pw_hash))) return c.json({ error: 'Your current password isn’t right.' }, 400);
   await c.env.DB.prepare('UPDATE users SET pw_hash = ? WHERE id = ?').bind(await hashPassword(next), c.get('user').id).run();
-  return c.json({ ok: true });
+  const signedOut = await endOtherSessions(c, c.get('user').id); // an old password must not keep other devices signed in
+  return c.json({ ok: true, signedOut });
+});
+app.post('/api/sessions/end-others', async c => c.json({ ok: true, signedOut: await endOtherSessions(c, c.get('user').id) }));
+
+/* ---------- what changed: one cheap request the app polls instead of reloading everything ---------- */
+app.get('/api/version', async c => {
+  const v = await versions(c.env);
+  return c.json({ ...v, sheets: { configured: !!(c.env.SHEETS_WEBHOOK_URL && c.env.SHEETS_TOKEN), url: c.env.SHEET_URL || null, ...v.sheets } });
+});
+
+/* ---------- backup: everything in one JSON file (no passwords or AI tokens) ---------- */
+app.get('/api/export', async c => {
+  const [settings, weeks, transactions, years] = await Promise.all([getSettings(c.env), listWeeks(c.env), getAllRows(c.env), listYears(c.env)]);
+  const body = { app: 'jam-paula-ledger', kind: 'backup', version: 1, exportedAt: new Date().toISOString(), settings, weeks, transactions, years };
+  return new Response(JSON.stringify(body, null, 1), { headers: {
+    'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store',
+    'content-disposition': `attachment; filename="ledger-backup-${todayISO(c.env.TZ)}.json"`,
+  } });
 });
 
 /* ---------- settings ---------- */
 app.get('/api/settings', async c => c.json(await getSettings(c.env)));
+/** {from: to} pairs from the settings dialog: short strings only. */
+const movesOf = (v: unknown) => {
+  const out: Record<string, string> = {};
+  if (v && typeof v === 'object') for (const [from, to] of Object.entries(v).slice(0, 60)) if (from && typeof to === 'string' && from.length <= 60 && to.length <= 60) out[from] = to;
+  return out;
+};
 app.put('/api/settings', async c => {
   const before = await getSettings(c.env);
-  const body = await c.req.json();
-  const saved = await saveSettings(c.env, { ...body, notion: body?.notion ?? before.notion });
-  if (JSON.stringify(before.cards) !== JSON.stringify(saved.cards)) await recomputeAll(c.env); // card payer changes move the transfer
+  const body = await c.req.json<any>();
+  const next = normalizeSettings({ ...body, notion: body?.notion ?? before.notion });
+  // transactions on a removed card, or in a renamed or removed category, move to the one picked in Settings
+  const cardMoves = movesOf(body?.cardMoves), catMoves = movesOf(body?.catMoves);
+  for (const [from, to] of Object.entries(cardMoves)) if (from === to || !next.cards.some(x => x.id === to)) delete cardMoves[from];
+  for (const [from, to] of Object.entries(catMoves)) if (from === to || (to !== '' && !next.categories.some(x => x.name === to))) delete catMoves[from];
+  for (const [file, card] of Object.entries(next.fileCards)) if (cardMoves[card]) next.fileCards[file] = cardMoves[card];
+  if (cardMoves[next.importCard]) next.importCard = cardMoves[next.importCard];
+  const saved = await saveSettings(c.env, next);
+  await moveRefs(c.env, cardMoves, catMoves);
+  // who pays a card moves the transfer, and so do moved cards
+  if (Object.keys(cardMoves).length || JSON.stringify(before.cards) !== JSON.stringify(saved.cards)) await recomputeAll(c.env);
   return c.json(saved);
 });
 
@@ -77,6 +111,7 @@ app.get('/api/weeks/:id/rows', async c => {
   if (!(await getWeek(c.env, c.req.param('id')))) return c.json({ items: [] });
   return c.json({ items: await getRows(c.env, c.req.param('id')) });
 });
+app.get('/api/rows', async c => c.json({ weeks: await getRowsOf(c.env, String(c.req.query('weeks') || '').split(',')) }));
 app.patch('/api/weeks/:id/rows', async c => {
   const body = await c.req.json<{ upsert?: unknown[]; delete?: unknown[] }>();
   return c.json(await patchRows(c.env, c.req.param('id'), body.upsert || [], body.delete || []));
@@ -86,9 +121,14 @@ app.patch('/api/weeks/:id/rows', async c => {
 const yearParam = (v: string) => { const y = Number(v); if (!/^\d{4}$/.test(v) || y < 2000 || y > 2100) throw new HttpError(400, 'Bad year.'); return y; };
 app.get('/api/years/:year', async c => c.json({ doc: await getYear(c.env, yearParam(c.req.param('year'))) }));
 app.put('/api/years/:year', async c => c.json({ doc: await saveYear(c.env, yearParam(c.req.param('year')), await c.req.json()) }));
+/* changes as small operations, applied to the latest saved copy (see applyYearOps in core.ts) */
+app.patch('/api/years/:year', async c => {
+  const body = await c.req.json<{ ops?: unknown }>().catch(() => ({} as { ops?: unknown }));
+  return c.json({ doc: await patchYear(c.env, yearParam(c.req.param('year')), body.ops) });
+});
 
 /* ---------- Ask AI ---------- */
-app.post('/api/ask', async c => c.json(await askAI(c.env, c.get('user'), await c.req.json().catch(() => ({})))));
+app.post('/api/ask', async c => askAI(c.env, c.get('user'), await c.req.json().catch(() => ({})), c.executionCtx));
 
 /* ---------- Google Sheets + Notion ---------- */
 app.get('/api/sheets', async c => c.json(await sheetsState(c.env)));

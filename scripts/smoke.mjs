@@ -33,6 +33,16 @@ if (weeks.data?.length) {
   const total = Math.round(rows.data.items.filter(r => r.mode !== 'X').reduce((a, r) => a + r.amt, 0) * 100) / 100;
   check(`rows of ${w.name}`, Math.abs(total - w.total) < 0.011, `${rows.data.items.length} rows, total ${total} vs stored ${w.total}`);
 }
+const ver = await call('GET', '/api/version');
+check('what changed (/api/version)', !!ver.data && typeof ver.data.weeks === 'object', `${Object.keys(ver.data?.weeks || {}).length} weeks · years ${Object.keys(ver.data?.years || {}).join(', ') || 'none'}`);
+if (weeks.data?.length) {
+  const ids = weeks.data.slice(0, 5).map(w => w.id);
+  const many = await call('GET', '/api/rows?weeks=' + ids.map(encodeURIComponent).join(','));
+  check('rows of several weeks at once', ids.every(id => Array.isArray(many.data?.weeks?.[id])), `${ids.length} week(s)`);
+}
+const backup = await fetch(base + '/api/export', { headers: { cookie } });
+const bk = await backup.json().catch(() => null);
+check('backup download', backup.status === 200 && Array.isArray(bk?.transactions), `${bk?.transactions?.length} transactions · ${bk?.years?.length} year(s)`);
 const year = new Date().getFullYear();
 const y = await call('GET', `/api/years/${year}`);
 check(`year ${year}`, y.status === 200, y.data?.doc ? `${Object.keys(y.data.doc.months).length} months with data` : 'no year document yet');

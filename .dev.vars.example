@@ -5,3 +5,4 @@ SHEETS_TOKEN=same-long-random-string-as-in-Code.gs
 # Ask AI on the website (optional)
 ANTHROPIC_API_KEY=
 # ANTHROPIC_MODEL=claude-sonnet-5-5
+# ANTHROPIC_EFFORT=medium   (low | medium | high | xhigh | max)

@@ -44,9 +44,25 @@ export interface SessionUser { id: string; username: string; name: string }
 
 export async function startSession(c: Ctx, user: SessionUser) {
   const sid = randomToken(32);
-  await c.env.SESSIONS.put(`s:${sid}`, JSON.stringify(user), { expirationTtl: TTL });
+  await c.env.SESSIONS.put(`s:${sid}`, JSON.stringify(user), { expirationTtl: TTL, metadata: { uid: user.id } });
   const secure = new URL(c.req.url).protocol === 'https:';
   setCookie(c, COOKIE, sid, { httpOnly: true, secure, sameSite: 'Lax', path: '/', maxAge: TTL });
+}
+/** Sign this person out on every other device (after a password change, or when they ask). */
+export async function endOtherSessions(c: Ctx, userId: string) {
+  const mine = `s:${getCookie(c, COOKIE) || ''}`;
+  let cursor: string | undefined, ended = 0;
+  do {
+    const page: KVNamespaceListResult<{ uid?: string }> = await c.env.SESSIONS.list<{ uid?: string }>({ prefix: 's:', cursor });
+    for (const k of page.keys) {
+      if (k.name === mine) continue;
+      // sessions made before the owner was kept as metadata: read the value instead
+      const uid = k.metadata?.uid ?? (JSON.parse((await c.env.SESSIONS.get(k.name)) || 'null') as SessionUser | null)?.id;
+      if (uid === userId) { await c.env.SESSIONS.delete(k.name); ended++; }
+    }
+    cursor = page.list_complete ? undefined : page.cursor;
+  } while (cursor);
+  return ended;
 }
 export async function endSession(c: Ctx) {
   const sid = getCookie(c, COOKIE);

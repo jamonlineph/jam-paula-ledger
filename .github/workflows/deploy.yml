@@ -16,6 +16,7 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npx tsc --noEmit
+      - run: npm test
       - name: Apply database migrations
         run: npx wrangler d1 migrations apply ledger --remote
         env:

@@ -17,7 +17,8 @@ self.addEventListener('fetch', event => {
   if (url.pathname.startsWith('/api/') || url.pathname.startsWith('/mcp') || url.pathname === '/healthz') return; // live data only
   if (req.mode === 'navigate') {
     // newest page when online, the saved one when offline
-    event.respondWith(fetch(req).then(res => { const copy = res.clone(); caches.open(VERSION).then(c => c.put('/', copy)); return res; }).catch(() => caches.match('/')));
+    // only a good page replaces the saved one (never an error page from a bad moment)
+    event.respondWith(fetch(req).then(res => { if (res.ok) { const copy = res.clone(); caches.open(VERSION).then(c => c.put('/', copy)); } return res; }).catch(() => caches.match('/')));
     return;
   }
   event.respondWith(caches.match(req).then(hit => hit || fetch(req).then(res => {
