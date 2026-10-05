@@ -1,0 +1,185 @@
+import { calc, normalizeSettings, normalizeYear, type Row, type Settings, type WeekMeta, type YearDoc } from './core';
+
+export interface Env {
+  DB: D1Database;
+  SESSIONS: KVNamespace;
+  ASSETS: Fetcher;
+  SHEET_URL?: string;          // link shown in the app
+  SHEETS_WEBHOOK_URL?: string; // Apps Script web app URL (secret)
+  SHEETS_TOKEN?: string;       // shared secret with the Apps Script (secret)
+  NOTION_TOKEN?: string;       // Notion internal integration token (secret, optional)
+  NOTION_API_BASE?: string;    // tests only
+  ANTHROPIC_API_KEY?: string;  // Ask AI on the website (secret, optional)
+  ANTHROPIC_MODEL?: string;    // defaults to claude-sonnet-5-5
+  ANTHROPIC_API_BASE?: string; // tests only
+  TZ?: string;
+}
+
+const now = () => new Date().toISOString();
+
+/* ---------- small JSON documents ---------- */
+export async function getDoc<T = any>(env: Env, key: string, fallback: T): Promise<T> {
+  const row = await env.DB.prepare('SELECT value FROM kv WHERE key = ?').bind(key).first<{ value: string }>();
+  if (!row) return fallback;
+  try { return JSON.parse(row.value) as T; } catch { return fallback; }
+}
+export async function putDoc(env: Env, key: string, value: unknown) {
+  await env.DB.prepare('INSERT INTO kv (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at')
+    .bind(key, JSON.stringify(value), now()).run();
+}
+export async function getSettings(env: Env): Promise<Settings> { return normalizeSettings(await getDoc(env, 'settings', null)); }
+export async function saveSettings(env: Env, s: unknown) { const n = normalizeSettings(s); await putDoc(env, 'settings', n); await markSheetsDirty(env); return n; }
+
+export async function getYear(env: Env, year: number): Promise<YearDoc | null> {
+  const raw = await getDoc<any>(env, `year:${year}`, null);
+  return raw ? normalizeYear(raw, year) : null;
+}
+export async function saveYear(env: Env, year: number, body: unknown) {
+  if (JSON.stringify(body ?? {}).length > 400_000) throw new HttpError(413, 'That year is too big to save.');
+  const doc = normalizeYear(body, year);
+  await putDoc(env, `year:${year}`, doc);
+  await markSheetsDirty(env);
+  return doc;
+}
+
+export async function markSheetsDirty(env: Env) {
+  const st = await getDoc<any>(env, 'sheets_state', {});
+  if (!st.dirty) await putDoc(env, 'sheets_state', { ...st, dirty: true, dirtySince: now() });
+}
+
+/* ---------- rows ---------- */
+interface TxnRow { id: string; week_id: string; date: string; description: string; amount: number; card: string; mode: string | null; p: number; j: number; s: number; note: string; src: string; sug: number; imp: string | null; dup_ok: number; cat: string | null }
+export const toRow = (t: TxnRow): Row => ({ id: t.id, date: t.date, desc: t.description, amt: t.amount, card: t.card, mode: (t.mode || null) as Row['mode'], p: t.p, j: t.j, s: t.s, note: t.note || '', src: t.src, sug: !!t.sug, imp: t.imp, dupOk: !!t.dup_ok, cat: t.cat || '' });
+
+export async function getRows(env: Env, weekId: string): Promise<Row[]> {
+  const { results } = await env.DB.prepare('SELECT * FROM txns WHERE week_id = ? ORDER BY date DESC, rowid ASC').bind(weekId).all<TxnRow>();
+  return results.map(toRow);
+}
+export async function getAllRows(env: Env): Promise<(Row & { weekId: string })[]> {
+  const { results } = await env.DB.prepare('SELECT * FROM txns ORDER BY date DESC, rowid ASC').all<TxnRow>();
+  return results.map(t => ({ ...toRow(t), weekId: t.week_id }));
+}
+export async function getRow(env: Env, id: string) {
+  const t = await env.DB.prepare('SELECT * FROM txns WHERE id = ?').bind(id).first<TxnRow>();
+  return t ? { ...toRow(t), weekId: t.week_id } : null;
+}
+
+function cleanRow(r: any): Row {
+  const num = (v: unknown) => Math.round((Number(v) || 0) * 100) / 100;
+  const mode = ['P', 'J', 'S', 'H', 'C', 'X'].includes(r.mode) ? r.mode : null;
+  if (!r || typeof r.id !== 'string' || !/^[A-Za-z0-9_-]{1,40}$/.test(r.id)) throw new HttpError(400, 'Each transaction needs a short id.');
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(r.date))) throw new HttpError(400, `Transaction ${r.id} has a bad date.`);
+  return {
+    id: r.id, date: r.date, desc: String(r.desc ?? '').slice(0, 300), amt: num(r.amt), card: typeof r.card === 'string' ? r.card.slice(0, 60) : 'main',
+    mode, p: num(r.p), j: num(r.j), s: num(r.s), note: String(r.note ?? '').slice(0, 500), src: ['csv', 'manual', 'ai', 'sheet'].includes(r.src) ? r.src : 'csv',
+    sug: !!r.sug, imp: r.imp ? String(r.imp).slice(0, 40) : null, dupOk: !!r.dupOk, cat: String(r.cat ?? '').slice(0, 60),
+  };
+}
+const upsertSql = `INSERT INTO txns (id, week_id, date, description, amount, card, mode, p, j, s, note, src, sug, imp, dup_ok, updated_at, cat)
+  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+  ON CONFLICT(id) DO UPDATE SET week_id = excluded.week_id, date = excluded.date, description = excluded.description, amount = excluded.amount,
+    card = excluded.card, mode = excluded.mode, p = excluded.p, j = excluded.j, s = excluded.s, note = excluded.note, src = excluded.src,
+    sug = excluded.sug, imp = excluded.imp, dup_ok = excluded.dup_ok, updated_at = excluded.updated_at, cat = excluded.cat`;
+
+/** Apply row changes to one week, then refresh its totals. */
+export async function patchRows(env: Env, weekId: string, upsert: unknown[] = [], del: unknown[] = []) {
+  const week = await getWeek(env, weekId);
+  if (!week) throw new HttpError(404, 'That week doesn’t exist.');
+  const ts = now();
+  const stmts: D1PreparedStatement[] = [];
+  const up = (upsert || []).map(cleanRow);
+  for (const r of up) {
+    stmts.push(env.DB.prepare(upsertSql).bind(r.id, weekId, r.date, r.desc, r.amt, r.card, r.mode, r.p, r.j, r.s, r.note, r.src, r.sug ? 1 : 0, r.imp ?? null, r.dupOk ? 1 : 0, ts, r.cat || ''));
+  }
+  const ids = (del || []).filter((x): x is string => typeof x === 'string');
+  for (let i = 0; i < ids.length; i += 90) {
+    const chunk = ids.slice(i, i + 90);
+    stmts.push(env.DB.prepare(`DELETE FROM txns WHERE week_id = ? AND id IN (${chunk.map(() => '?').join(',')})`).bind(weekId, ...chunk));
+  }
+  if (stmts.length) await env.DB.batch(stmts);
+  await recomputeWeek(env, weekId);
+  if (stmts.length) await markSheetsDirty(env);
+  return { upserted: up.length, deleted: ids.length };
+}
+
+/* ---------- weeks ---------- */
+interface WeekRow { id: string; name: string; created: string; ratio_p: number; paid: string | null; meta: string; count: number; total: number; settle: number; min_date: string | null; max_date: string | null; updated_at: string }
+const toWeek = (w: WeekRow): WeekMeta => {
+  let meta: Record<string, unknown> = {};
+  try { meta = JSON.parse(w.meta || '{}'); } catch { /* keep empty */ }
+  return { ...meta, id: w.id, name: w.name, created: w.created, ratioP: w.ratio_p, paid: w.paid, count: w.count, total: w.total, settle: w.settle, minDate: w.min_date, maxDate: w.max_date, updatedAt: w.updated_at } as WeekMeta;
+};
+export async function listWeeks(env: Env): Promise<WeekMeta[]> {
+  const { results } = await env.DB.prepare('SELECT * FROM weeks ORDER BY created DESC').all<WeekRow>();
+  return results.map(toWeek);
+}
+export async function getWeek(env: Env, id: string) {
+  const w = await env.DB.prepare('SELECT * FROM weeks WHERE id = ?').bind(id).first<WeekRow>();
+  return w ? toWeek(w) : null;
+}
+/** Resolve "latest", an id, or a week name. */
+export async function findWeek(env: Env, ref?: string | null) {
+  const weeks = await listWeeks(env);
+  if (!weeks.length) return null;
+  if (!ref || /^latest$/i.test(ref)) return weeks[0];
+  const r = String(ref).trim().toLowerCase();
+  return weeks.find(w => w.id.toLowerCase() === r) || weeks.find(w => w.name.toLowerCase() === r) || weeks.find(w => w.name.toLowerCase().includes(r)) || null;
+}
+
+const SERVER_FIELDS = new Set(['id', 'name', 'created', 'ratioP', 'paid', 'count', 'total', 'settle', 'minDate', 'maxDate', 'updatedAt', 'notion']);
+/** Create or update a week from the app. Totals and the Notion map are owned by the server. */
+export async function putWeek(env: Env, id: string, body: any, opts: { keepNotion?: boolean } = { keepNotion: true }) {
+  if (!/^[A-Za-z0-9_-]{1,40}$/.test(id)) throw new HttpError(400, 'Bad week id.');
+  const existing = await getWeek(env, id);
+  const meta: Record<string, unknown> = {};
+  if (existing) for (const [k, v] of Object.entries(existing)) if (!SERVER_FIELDS.has(k)) meta[k] = v;
+  for (const [k, v] of Object.entries(body || {})) if (!SERVER_FIELDS.has(k)) meta[k] = v;
+  meta.notion = opts.keepNotion ? (existing?.notion ?? null) : (body?.notion ?? null);
+  const name = String(body?.name ?? existing?.name ?? 'Untitled week').slice(0, 80) || 'Untitled week';
+  const settings = await getSettings(env);
+  let ratio = Number(body?.ratioP ?? existing?.ratioP ?? settings.ratioP);
+  if (!isFinite(ratio)) ratio = settings.ratioP;
+  ratio = Math.min(100, Math.max(0, Math.round(ratio)));
+  const paid = body && 'paid' in body ? (body.paid ? String(body.paid).slice(0, 10) : null) : (existing?.paid ?? null);
+  const created = existing?.created || (typeof body?.created === 'string' ? body.created : now());
+  await env.DB.prepare(`INSERT INTO weeks (id, name, created, ratio_p, paid, meta, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET name = excluded.name, ratio_p = excluded.ratio_p, paid = excluded.paid, meta = excluded.meta, updated_at = excluded.updated_at`)
+    .bind(id, name, created, ratio, paid, JSON.stringify(meta), now()).run();
+  await recomputeWeek(env, id);
+  await markSheetsDirty(env);
+  return getWeek(env, id);
+}
+export async function setWeekNotion(env: Env, id: string, notion: unknown) {
+  const w = await env.DB.prepare('SELECT meta FROM weeks WHERE id = ?').bind(id).first<{ meta: string }>();
+  if (!w) return;
+  let meta: Record<string, unknown> = {};
+  try { meta = JSON.parse(w.meta || '{}'); } catch { /* ignore */ }
+  meta.notion = notion;
+  await env.DB.prepare('UPDATE weeks SET meta = ?, updated_at = ? WHERE id = ?').bind(JSON.stringify(meta), now(), id).run();
+}
+export async function deleteWeek(env: Env, id: string) {
+  await env.DB.batch([env.DB.prepare('DELETE FROM txns WHERE week_id = ?').bind(id), env.DB.prepare('DELETE FROM weeks WHERE id = ?').bind(id)]);
+  await markSheetsDirty(env);
+}
+export async function recomputeWeek(env: Env, id: string) {
+  const w = await env.DB.prepare('SELECT ratio_p FROM weeks WHERE id = ?').bind(id).first<{ ratio_p: number }>();
+  if (!w) return;
+  const settings = await getSettings(env);
+  const rows = await getRows(env, id);
+  const t = calc(rows, w.ratio_p, settings.cards);
+  await env.DB.prepare('UPDATE weeks SET count = ?, total = ?, settle = ?, min_date = ?, max_date = ? WHERE id = ?')
+    .bind(t.count, t.total, t.settle, t.min, t.max, id).run();
+}
+export async function recomputeAll(env: Env) {
+  for (const w of await listWeeks(env)) await recomputeWeek(env, w.id);
+}
+export function newWeekId(existing: { id: string }[], date = new Date()) {
+  const base = 'p' + date.toISOString().slice(0, 10).replace(/-/g, '');
+  let id = base, n = 2;
+  while (existing.some(w => w.id === id)) id = `${base}-${n++}`;
+  return id;
+}
+
+export class HttpError extends Error {
+  constructor(public status: number, message: string) { super(message); }
+}

@@ -1,0 +1,26 @@
+{
+  "name": "jam-paula-ledger",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler d1 migrations apply ledger --remote && wrangler deploy",
+    "setup": "node scripts/setup.mjs",
+    "user:add": "node scripts/add-user.mjs",
+    "db:migrate:local": "wrangler d1 migrations apply ledger --local",
+    "typecheck": "tsc --noEmit",
+    "seed:2026": "wrangler d1 execute ledger --remote --file seed/2026-workbook.sql",
+    "seed:2026:local": "wrangler d1 execute ledger --local --file seed/2026-workbook.sql",
+    "smoke": "node scripts/smoke.mjs",
+    "build:artifact": "node scripts/build-artifact.mjs"
+  },
+  "dependencies": {
+    "hono": "^4.6.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261001.1",
+    "typescript": "^5.6.0",
+    "wrangler": "^4.147.0"
+  }
+}

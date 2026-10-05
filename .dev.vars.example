@@ -1,0 +1,7 @@
+# Copy to .dev.vars for `npm run dev`. In production use `npx wrangler secret put <NAME>`.
+SHEETS_WEBHOOK_URL=https://script.google.com/macros/s/XXXXXXXX/exec
+SHEETS_TOKEN=same-long-random-string-as-in-Code.gs
+# NOTION_TOKEN=ntn_xxx   (optional: Notion internal integration token)
+# Ask AI on the website (optional)
+ANTHROPIC_API_KEY=
+# ANTHROPIC_MODEL=claude-sonnet-5-5

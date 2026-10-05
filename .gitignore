@@ -1,0 +1,8 @@
+node_modules/
+.wrangler/
+.dev.vars
+*.log
+dist/
+.DS_Store
+# real household data: only commit while the repo is private
+seed/*.sql
