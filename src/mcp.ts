@@ -5,10 +5,10 @@
 
 import {
   applyMode, calc, catGroup, catOf, catStats, classifyImport, dShort, GROUPS, merchantStats, modeFrom, modeLabel, money, MONTH_KEYS, MONTH_LONG,
-  monthBudgetLines, normalizeYear, parts, parseGrid, parseStatement, r2, rid, suggest, suggestCat, todayISO, yearAgg,
+  monthBudgetLines, normalizeYear, parts, parseGrid, parseStatement, r2, rid, suggest, suggestCat, thisYear, todayISO, yearAgg,
   type ParsedLine, type Row, type Settings, type WeekMeta,
 } from './core';
-import { findWeek, getAllRows, getRow, getRows, getSettings, getYear, HttpError, listWeeks, newWeekId, patchRows, putWeek, saveYear, type Env } from './db';
+import { findWeek, getAllRows, getRow, getRows, getSettings, getYear, HttpError, listWeeks, listYears, newWeekId, patchRows, patchYear, putWeek, type Env } from './db';
 import { sha256 } from './auth';
 import { notionSyncWeek, pushSheets, sheetsState } from './sync';
 
@@ -254,7 +254,11 @@ export async function callTool(env: Env, name: string, args: any): Promise<unkno
       if (args.amount != null) {
         const a = Number(args.amount); if (!isFinite(a) || a === 0) throw new HttpError(400, 'amount must be a non-zero number.');
         row.amt = r2(a);
-        if (row.mode && row.mode !== 'C' && args.split == null) applyMode(row, row.mode);
+        if (row.mode === 'C' && args.split == null) {
+          // keep each person's typed amount; the shared part is what's left of the new amount
+          if (Math.abs(row.p + row.j) > Math.abs(row.amt) + 0.005 || (row.p + row.j) * row.amt < 0) throw new HttpError(400, `This item has a custom split (${settings.names.p} ${r2(row.p)}, ${settings.names.j} ${r2(row.j)}) that doesn't fit an amount of ${r2(row.amt)}. Pass split too, for example split="custom" with new paula_amount and jam_amount.`);
+          applyMode(row, 'C', { p: row.p, j: row.j });
+        } else if (row.mode && args.split == null) applyMode(row, row.mode);
       }
       applySplit(row, args, settings);
       applyCategory(row, args, settings);
@@ -303,9 +307,8 @@ export async function callTool(env: Env, name: string, args: any): Promise<unkno
       }
       if (add.length) {
         await patchRows(env, w.id, add, []);
-        const fresh = (await findWeek(env, w.id))!;
         const dates = add.map(r => r.date).sort();
-        await putWeek(env, w.id, { ...fresh, imports: [...((fresh.imports as any[]) || []), { id: impId, file: String(args.file_name || 'Imported by AI'), card: card.id, from: args.from || dates[0], to: args.until || dates[dates.length - 1], n: add.length, at: new Date().toISOString() }] });
+        await putWeek(env, w.id, { importsAdd: [{ id: impId, file: String(args.file_name || 'Imported by AI'), card: card.id, from: args.from || dates[0], to: args.until || dates[dates.length - 1], n: add.length, at: new Date().toISOString() }] });
       }
       const count = (s: string) => items.filter(x => x.status === s).length;
       return {
@@ -336,7 +339,7 @@ export async function callTool(env: Env, name: string, args: any): Promise<unkno
       return { text: summaryText(w, rows, settings), numbers: weekSummary(w, rows, settings) };
     }
     case 'year_overview': {
-      const year = Number(args.year) || new Date().getFullYear();
+      const year = Number(args.year) || thisYear(env.TZ);
       const { doc, agg } = await yearData(env, settings, year);
       const n = settings.names;
       if (args.month == null || args.month === '') {
@@ -370,44 +373,33 @@ export async function callTool(env: Env, name: string, args: any): Promise<unkno
     case 'set_budget': {
       const cat = catOf(settings, args.category);
       if (!cat) throw new HttpError(400, `Unknown category "${args.category}". Categories: ${settings.categories.map(x => x.name).join(', ')}.`);
-      const now = new Date();
-      const from = args.month != null && args.month !== '' ? monthOf(args.month, now.getFullYear()) : { year: now.getFullYear(), mm: String(now.getMonth() + 1).padStart(2, '0') };
+      const today = todayISO(env.TZ);
+      const from = args.month != null && args.month !== '' ? monthOf(args.month, +today.slice(0, 4)) : { year: +today.slice(0, 4), mm: today.slice(5, 7) };
       const to = args.through_month ? monthOf(args.through_month, from.year) : from;
       if (to.year !== from.year || to.mm < from.mm) throw new HttpError(400, 'through_month must be later in the same year.');
       const amount = args.amount === null || args.amount === undefined ? null : Number(args.amount);
       if (amount !== null && !isFinite(amount)) throw new HttpError(400, 'amount must be a number, or null to remove the budget.');
-      const doc = (await getYear(env, from.year)) || normalizeYear(null, from.year);
-      const changed: string[] = [];
-      for (const mm of MONTH_KEYS.filter(k => k >= from.mm && k <= to.mm)) {
-        const md = doc.months[mm] || (doc.months[mm] = { budget: {}, income: [], pct: {}, saved: {} });
-        if (amount === null) delete md.budget[cat]; else md.budget[cat] = r2(amount);
-        delete md.budgetFrom; changed.push(MONTH_LONG[+mm - 1]);
-      }
-      await saveYear(env, from.year, doc);
-      return { category: cat, group: catGroup(settings, cat), amount: amount === null ? null : r2(amount), months: changed, year: from.year };
+      const months = MONTH_KEYS.filter(k => k >= from.mm && k <= to.mm);
+      await patchYear(env, from.year, months.map(mm => ({ op: 'budget', mm, cat, v: amount === null ? null : r2(amount) })));
+      return { category: cat, group: catGroup(settings, cat), amount: amount === null ? null : r2(amount), months: months.map(mm => MONTH_LONG[+mm - 1]), year: from.year };
     }
     case 'add_income': {
       if (!isDate(args.date)) throw new HttpError(400, 'date must be YYYY-MM-DD.');
       const amt = Number(args.amount); if (!isFinite(amt) || amt === 0) throw new HttpError(400, 'amount must be a non-zero number.');
       if (!String(args.source || '').trim()) throw new HttpError(400, 'source is required, e.g. "Valard".');
       const year = +args.date.slice(0, 4), mm = args.date.slice(5, 7);
-      const doc = (await getYear(env, year)) || normalizeYear(null, year);
-      const md = doc.months[mm] || (doc.months[mm] = { budget: {}, income: [], pct: {}, saved: {} });
       const who = modeFrom(args.who, settings);
       const entry = { id: rid('i'), date: args.date, source: String(args.source).trim().slice(0, 80), who: (who === 'P' ? 'p' : who === 'J' ? 'j' : '') as 'p' | 'j' | '', amt: r2(amt), note: String(args.note || '').slice(0, 300) };
-      md.income.push(entry);
-      await saveYear(env, year, doc);
-      return { added: { ...entry, who: entry.who === 'p' ? settings.names.p : entry.who === 'j' ? settings.names.j : 'other' }, month: `${MONTH_LONG[+mm - 1]} ${year}`, month_income: r2(md.income.reduce((a, i) => a + i.amt, 0)) };
+      const doc = await patchYear(env, year, [{ op: 'incomeAdd', entry }]);
+      return { added: { ...entry, who: entry.who === 'p' ? settings.names.p : entry.who === 'j' ? settings.names.j : 'other' }, month: `${MONTH_LONG[+mm - 1]} ${year}`, month_income: r2((doc.months[mm]?.income || []).reduce((a, i) => a + i.amt, 0)) };
     }
     case 'remove_income': {
       const id = String(args.id || '');
-      for (const year of [new Date().getFullYear(), new Date().getFullYear() - 1, new Date().getFullYear() + 1]) {
-        const doc = await getYear(env, year); if (!doc) continue;
+      for (const doc of await listYears(env)) {
         for (const [mm, md] of Object.entries(doc.months)) {
-          const i = md.income.findIndex(x => x.id === id); if (i < 0) continue;
-          const [gone] = md.income.splice(i, 1);
-          await saveYear(env, year, doc);
-          return { removed: gone, month: `${MONTH_LONG[+mm - 1]} ${year}` };
+          const gone = md.income.find(x => x.id === id); if (!gone) continue;
+          await patchYear(env, doc.year, [{ op: 'incomeDel', id }]);
+          return { removed: gone, month: `${MONTH_LONG[+mm - 1]} ${doc.year}` };
         }
       }
       throw new HttpError(404, `No income entry with id "${id}". Use year_overview with a month to see the ids.`);

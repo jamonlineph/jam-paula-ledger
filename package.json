@@ -13,9 +13,11 @@
     "seed:2026": "wrangler d1 execute ledger --remote --file seed/2026-workbook.sql",
     "seed:2026:local": "wrangler d1 execute ledger --local --file seed/2026-workbook.sql",
     "smoke": "node scripts/smoke.mjs",
-    "build:artifact": "node scripts/build-artifact.mjs"
+    "build:artifact": "node scripts/build-artifact.mjs",
+    "test": "node scripts/parity-test.mjs"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.131.0",
     "hono": "^4.6.0"
   },
   "devDependencies": {

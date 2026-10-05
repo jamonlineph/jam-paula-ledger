@@ -1,4 +1,4 @@
-import { calc, normalizeSettings, normalizeYear, type Row, type Settings, type WeekMeta, type YearDoc } from './core';
+import { applyYearOps, calc, normalizeSettings, normalizeYear, type Row, type Settings, type WeekMeta, type YearDoc } from './core';
 
 export interface Env {
   DB: D1Database;
@@ -11,6 +11,7 @@ export interface Env {
   NOTION_API_BASE?: string;    // tests only
   ANTHROPIC_API_KEY?: string;  // Ask AI on the website (secret, optional)
   ANTHROPIC_MODEL?: string;    // defaults to claude-sonnet-5-5
+  ANTHROPIC_EFFORT?: string;   // low | medium (default) | high | xhigh | max
   ANTHROPIC_API_BASE?: string; // tests only
   TZ?: string;
 }
@@ -41,6 +42,23 @@ export async function saveYear(env: Env, year: number, body: unknown) {
   await markSheetsDirty(env);
   return doc;
 }
+/** Apply changes to the latest saved copy of a year (see applyYearOps). */
+export async function patchYear(env: Env, year: number, ops: unknown) {
+  if (!Array.isArray(ops) || ops.length > 500) throw new HttpError(400, 'Send a list of up to 500 changes.');
+  const doc = (await getYear(env, year)) || normalizeYear(null, year);
+  if (!ops.length) return doc;
+  return saveYear(env, year, applyYearOps(doc, ops));
+}
+/** Every saved year document, oldest first. */
+export async function listYears(env: Env): Promise<YearDoc[]> {
+  const { results } = await env.DB.prepare("SELECT key, value FROM kv WHERE key LIKE 'year:%' ORDER BY key").all<{ key: string; value: string }>();
+  const out: YearDoc[] = [];
+  for (const r of results) {
+    const y = Number(r.key.slice(5)); if (!isFinite(y)) continue;
+    try { out.push(normalizeYear(JSON.parse(r.value), y)); } catch { /* skip a broken document */ }
+  }
+  return out;
+}
 
 export async function markSheetsDirty(env: Env) {
   const st = await getDoc<any>(env, 'sheets_state', {});
@@ -58,6 +76,15 @@ export async function getRows(env: Env, weekId: string): Promise<Row[]> {
 export async function getAllRows(env: Env): Promise<(Row & { weekId: string })[]> {
   const { results } = await env.DB.prepare('SELECT * FROM txns ORDER BY date DESC, rowid ASC').all<TxnRow>();
   return results.map(t => ({ ...toRow(t), weekId: t.week_id }));
+}
+/** Rows of several weeks in one query (the app's year view, history and search load every week). */
+export async function getRowsOf(env: Env, weekIds: string[]): Promise<Record<string, Row[]>> {
+  const ids = [...new Set(weekIds)].filter(id => /^[A-Za-z0-9_-]{1,40}$/.test(id)).slice(0, 90);
+  const out: Record<string, Row[]> = Object.fromEntries(ids.map(id => [id, []]));
+  if (!ids.length) return out;
+  const { results } = await env.DB.prepare(`SELECT * FROM txns WHERE week_id IN (${ids.map(() => '?').join(',')}) ORDER BY date DESC, rowid ASC`).bind(...ids).all<TxnRow>();
+  for (const t of results) out[t.week_id].push(toRow(t));
+  return out;
 }
 export async function getRow(env: Env, id: string) {
   const t = await env.DB.prepare('SELECT * FROM txns WHERE id = ?').bind(id).first<TxnRow>();
@@ -96,9 +123,10 @@ export async function patchRows(env: Env, weekId: string, upsert: unknown[] = []
     const chunk = ids.slice(i, i + 90);
     stmts.push(env.DB.prepare(`DELETE FROM txns WHERE week_id = ? AND id IN (${chunk.map(() => '?').join(',')})`).bind(weekId, ...chunk));
   }
-  if (stmts.length) await env.DB.batch(stmts);
+  if (!stmts.length) return { upserted: 0, deleted: 0 };
+  await env.DB.batch(stmts);
   await recomputeWeek(env, weekId);
-  if (stmts.length) await markSheetsDirty(env);
+  await markSheetsDirty(env);
   return { upserted: up.length, deleted: ids.length };
 }
 
@@ -126,14 +154,22 @@ export async function findWeek(env: Env, ref?: string | null) {
   return weeks.find(w => w.id.toLowerCase() === r) || weeks.find(w => w.name.toLowerCase() === r) || weeks.find(w => w.name.toLowerCase().includes(r)) || null;
 }
 
-const SERVER_FIELDS = new Set(['id', 'name', 'created', 'ratioP', 'paid', 'count', 'total', 'settle', 'minDate', 'maxDate', 'updatedAt', 'notion']);
-/** Create or update a week from the app. Totals and the Notion map are owned by the server. */
+const SERVER_FIELDS = new Set(['id', 'name', 'created', 'ratioP', 'paid', 'count', 'total', 'settle', 'minDate', 'maxDate', 'updatedAt', 'notion', 'importsAdd', 'importsRemove']);
+/** Create or update a week from the app. Totals and the Notion map are owned by the server.
+    Fields left out of the body keep their saved value, so the app sends only what it changed.
+    importsAdd / importsRemove change the imported-files list without resending (and overwriting) it. */
 export async function putWeek(env: Env, id: string, body: any, opts: { keepNotion?: boolean } = { keepNotion: true }) {
   if (!/^[A-Za-z0-9_-]{1,40}$/.test(id)) throw new HttpError(400, 'Bad week id.');
   const existing = await getWeek(env, id);
   const meta: Record<string, unknown> = {};
   if (existing) for (const [k, v] of Object.entries(existing)) if (!SERVER_FIELDS.has(k)) meta[k] = v;
   for (const [k, v] of Object.entries(body || {})) if (!SERVER_FIELDS.has(k)) meta[k] = v;
+  if (Array.isArray(body?.importsAdd) || Array.isArray(body?.importsRemove)) {
+    const list = (Array.isArray(meta.imports) ? meta.imports : []) as { id?: unknown }[];
+    const gone = new Set((body.importsRemove || []).map(String));
+    const add = (body.importsAdd || []).filter((x: any) => x && typeof x.id === 'string' && !list.some(l => l?.id === x.id));
+    meta.imports = list.filter(l => !gone.has(String(l?.id))).concat(add);
+  }
   meta.notion = opts.keepNotion ? (existing?.notion ?? null) : (body?.notion ?? null);
   const name = String(body?.name ?? existing?.name ?? 'Untitled week').slice(0, 80) || 'Untitled week';
   const settings = await getSettings(env);
@@ -157,21 +193,73 @@ export async function setWeekNotion(env: Env, id: string, notion: unknown) {
   meta.notion = notion;
   await env.DB.prepare('UPDATE weeks SET meta = ?, updated_at = ? WHERE id = ?').bind(JSON.stringify(meta), now(), id).run();
 }
+/** Settings: move every transaction off a removed card, and off a renamed or removed category
+    (an empty target clears the category). Budgets and savings in every year follow a category. */
+export async function moveRefs(env: Env, cardMoves: Record<string, string>, catMoves: Record<string, string>) {
+  const ts = now(), stmts: D1PreparedStatement[] = [];
+  for (const [from, to] of Object.entries(cardMoves)) {
+    stmts.push(env.DB.prepare('UPDATE weeks SET updated_at = ? WHERE id IN (SELECT DISTINCT week_id FROM txns WHERE card = ?)').bind(ts, from));
+    stmts.push(env.DB.prepare('UPDATE txns SET card = ?, updated_at = ? WHERE card = ?').bind(to, ts, from));
+  }
+  for (const [from, to] of Object.entries(catMoves)) {
+    stmts.push(env.DB.prepare('UPDATE weeks SET updated_at = ? WHERE id IN (SELECT DISTINCT week_id FROM txns WHERE cat = ?)').bind(ts, from));
+    stmts.push(env.DB.prepare('UPDATE txns SET cat = ?, updated_at = ? WHERE cat = ?').bind(to, ts, from));
+  }
+  if (stmts.length) await env.DB.batch(stmts);
+  const ops = Object.entries(catMoves).map(([from, to]) => ({ op: 'renameCat', from, to }));
+  if (ops.length) {
+    for (const doc of await listYears(env)) {
+      const before = JSON.stringify(doc);
+      applyYearOps(doc, ops);
+      if (JSON.stringify(doc) !== before) await putDoc(env, `year:${doc.year}`, doc);
+    }
+  }
+  if (stmts.length || ops.length) await markSheetsDirty(env);
+}
+/** What changed when: the app polls this instead of reloading everything every 20 seconds. */
+export async function versions(env: Env) {
+  const [kv, weeks] = await Promise.all([
+    env.DB.prepare("SELECT key, updated_at, CASE WHEN key = 'sheets_state' THEN value END AS value FROM kv WHERE key IN ('settings', 'sheets_state') OR key LIKE 'year:%'").all<{ key: string; updated_at: string; value: string | null }>(),
+    env.DB.prepare('SELECT id, updated_at FROM weeks').all<{ id: string; updated_at: string }>(),
+  ]);
+  const out = { settings: '', years: {} as Record<string, string>, weeks: {} as Record<string, string>, sheets: {} as Record<string, unknown> };
+  for (const r of kv.results) {
+    if (r.key === 'settings') out.settings = r.updated_at;
+    else if (r.key === 'sheets_state') { try { out.sheets = JSON.parse(r.value || '{}'); } catch { /* keep empty */ } }
+    else out.years[r.key.slice(5)] = r.updated_at;
+  }
+  for (const w of weeks.results) out.weeks[w.id] = w.updated_at;
+  return out;
+}
 export async function deleteWeek(env: Env, id: string) {
   await env.DB.batch([env.DB.prepare('DELETE FROM txns WHERE week_id = ?').bind(id), env.DB.prepare('DELETE FROM weeks WHERE id = ?').bind(id)]);
   await markSheetsDirty(env);
 }
+/** Refresh one week's stored totals. updated_at moves too, which tells open apps to reload its rows. */
 export async function recomputeWeek(env: Env, id: string) {
   const w = await env.DB.prepare('SELECT ratio_p FROM weeks WHERE id = ?').bind(id).first<{ ratio_p: number }>();
   if (!w) return;
   const settings = await getSettings(env);
   const rows = await getRows(env, id);
   const t = calc(rows, w.ratio_p, settings.cards);
-  await env.DB.prepare('UPDATE weeks SET count = ?, total = ?, settle = ?, min_date = ?, max_date = ? WHERE id = ?')
-    .bind(t.count, t.total, t.settle, t.min, t.max, id).run();
+  await env.DB.prepare('UPDATE weeks SET count = ?, total = ?, settle = ?, min_date = ?, max_date = ?, updated_at = ? WHERE id = ?')
+    .bind(t.count, t.total, t.settle, t.min, t.max, now(), id).run();
 }
+/** Refresh every week after a change that can move totals (a card's payer, moved cards).
+    Three reads and one batch, whatever the number of weeks: D1 allows 50 queries per request on the free plan. */
 export async function recomputeAll(env: Env) {
-  for (const w of await listWeeks(env)) await recomputeWeek(env, w.id);
+  const [weeks, settings, rows] = await Promise.all([listWeeks(env), getSettings(env), getAllRows(env)]);
+  const byWeek = new Map<string, Row[]>();
+  for (const r of rows) { const list = byWeek.get(r.weekId); if (list) list.push(r); else byWeek.set(r.weekId, [r]); }
+  const ts = now(), stmts: D1PreparedStatement[] = [];
+  for (const w of weeks) {
+    const t = calc(byWeek.get(w.id) || [], w.ratioP, settings.cards);
+    if (t.count === w.count && t.total === w.total && t.settle === w.settle && t.min === w.minDate && t.max === w.maxDate) continue;
+    stmts.push(env.DB.prepare('UPDATE weeks SET count = ?, total = ?, settle = ?, min_date = ?, max_date = ?, updated_at = ? WHERE id = ?')
+      .bind(t.count, t.total, t.settle, t.min, t.max, ts, w.id));
+  }
+  if (stmts.length) await env.DB.batch(stmts);
+  return stmts.length;
 }
 export function newWeekId(existing: { id: string }[], date = new Date()) {
   const base = 'p' + date.toISOString().slice(0, 10).replace(/-/g, '');

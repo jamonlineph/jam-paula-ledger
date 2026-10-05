@@ -16,7 +16,7 @@
     { "src": "/icons/maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
   ],
   "shortcuts": [
-    { "name": "2026 overview", "short_name": "Year", "url": "/?view=year", "icons": [{ "src": "/icons/icon-192.png", "sizes": "192x192" }] },
+    { "name": "Year overview", "short_name": "Year", "url": "/?view=year", "icons": [{ "src": "/icons/icon-192.png", "sizes": "192x192" }] },
     { "name": "Ask AI", "short_name": "Ask AI", "url": "/?view=ask", "icons": [{ "src": "/icons/icon-192.png", "sizes": "192x192" }] }
   ]
 }

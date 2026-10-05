@@ -1,5 +1,5 @@
 import { calc, catGroup, modeLabel, MONTH_KEYS, MONTH_LONG, monthBudgetLines, normalizeYear, NotionRec, parts, r2, yearAgg, type Row, type WeekMeta } from './core';
-import { getAllRows, getDoc, getRows, getSettings, getWeek, getYear, listWeeks, putDoc, setWeekNotion, type Env, HttpError } from './db';
+import { getAllRows, getDoc, getRows, getSettings, getWeek, listWeeks, listYears, putDoc, setWeekNotion, type Env, HttpError } from './db';
 
 const SOURCE: Record<string, string> = { manual: 'Added by hand', ai: 'Added by AI', sheet: '2026 workbook', csv: 'Bank file' };
 /* ===================== Google Sheets =====================
@@ -41,18 +41,23 @@ export async function buildSheetPayload(env: Env) {
     weekRows.push([w.id, w.name, rec ? 'Month (workbook)' : 'Week', t.min || '', t.max || '', t.count, t.total, t.p, t.j, t.s, `${w.ratioP}/${100 - w.ratioP}`, t.pShare, t.jShare,
       rec ? 'No transfer (month record)' : t.settle >= 0 ? `${settings.names.p} pays ${settings.names.j}` : `${settings.names.j} pays ${settings.names.p}`, r2(Math.abs(t.settle)), w.paid || '', t.un, syncedAt]);
   }
-  // the year: one line per month, budget lines and income
-  const year = new Date().getFullYear();
-  const doc = (await getYear(env, year)) || normalizeYear(null, year);
+  // every year with data: one line per month, budget lines and income (a new year never wipes the last one)
+  const docs = new Map((await listYears(env)).map(d => [d.year, d]));
+  const years = new Set<number>(docs.keys());
+  rows.forEach(r => { const y = Number(r.date.slice(0, 4)); if (y) years.add(y); });
   const ratio = new Map(weeks.map(w => [w.id, w.ratioP]));
-  const agg = yearAgg(rows.map(r => ({ row: r, ratioP: ratio.get(r.weekId) ?? settings.ratioP })), doc, settings);
+  const withRatio = rows.map(r => ({ row: r, ratioP: ratio.get(r.weekId) ?? settings.ratioP }));
   const monthRows: unknown[][] = [], budgetRows: unknown[][] = [], incomeRows: unknown[][] = [];
-  for (const mm of MONTH_KEYS) {
-    const m = agg[mm]; if (!m) continue;
-    const label = `${MONTH_LONG[+mm - 1]} ${year}`;
-    monthRows.push([label, m.income, m.incP, m.incJ, m.incO, r2(m.spent), r2(m.income - m.spent), m.budget, m.saved, r2(m.p), r2(m.j), m.unAmt]);
-    for (const l of monthBudgetLines(mm, m, doc, settings)) budgetRows.push([label, l.category, l.group, l.budget, l.spent, l.left]);
-    for (const i of (doc.months[mm]?.income || []).slice().sort((a, b) => a.date.localeCompare(b.date))) incomeRows.push([i.date, label, i.source, i.who === 'p' ? settings.names.p : i.who === 'j' ? settings.names.j : '', i.amt, i.note || '']);
+  for (const year of [...years].sort((a, b) => a - b)) {
+    const doc = docs.get(year) || normalizeYear(null, year);
+    const agg = yearAgg(withRatio, doc, settings);
+    for (const mm of MONTH_KEYS) {
+      const m = agg[mm]; if (!m) continue;
+      const label = `${MONTH_LONG[+mm - 1]} ${year}`;
+      monthRows.push([label, m.income, m.incP, m.incJ, m.incO, r2(m.spent), r2(m.income - m.spent), m.budget, m.saved, r2(m.p), r2(m.j), m.unAmt]);
+      for (const l of monthBudgetLines(mm, m, doc, settings)) budgetRows.push([label, l.category, l.group, l.budget, l.spent, l.left]);
+      for (const i of (doc.months[mm]?.income || []).slice().sort((a, b) => a.date.localeCompare(b.date))) incomeRows.push([i.date, label, i.source, i.who === 'p' ? settings.names.p : i.who === 'j' ? settings.names.j : '', i.amt, i.note || '']);
+    }
   }
   return {
     transactions: { header: TX_HEADER, rows: txRows }, weeks: { header: WEEK_HEADER, rows: weekRows },

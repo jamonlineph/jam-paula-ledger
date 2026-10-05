@@ -2,7 +2,9 @@
 
 The weekly budget split, on its own website. It works without Claude, Paula can sign in from her phone, and any AI can connect to it over MCP.
 
-Every transaction has a budget category (Grocery, Eat Out, Rent…). The **2026 overview** button shows income, spending by category against each month's budget, what's left, each person's share, and your savings balances, the same way your 2026 Income & Expense workbook did.
+Every transaction has a budget category (Grocery, Eat Out, Rent…). The **Year overview** button shows income, spending by category against each month's budget, what's left, each person's share, and your savings balances, the same way your 2026 Income & Expense workbook did. Pick any year at the top; in December, **Copy these budgets** fills every month of the next year.
+
+Each week also shows how its categories stand against this month's budget, and a **Not paid yet** panel adds up every week whose transfer isn't marked paid. Search finds things in the open week, or in every week at once with **All weeks**.
 
 ```
 browser ──login──▶  Cloudflare Worker (Hono)  ──▶  D1 (weeks, transactions, settings)
@@ -36,7 +38,7 @@ npm run user:add -- jam "Jam"
 npm run user:add -- paula "Paula"
 ```
 
-You'll be asked for each password (10+ characters). Only a PBKDF2 hash is stored. Run the same command again to reset a password. Each person can also change their own password in **Settings → Account**.
+You'll be asked for each password (10+ characters). Only a PBKDF2 hash is stored. Run the same command again to reset a password. Each person can also change their own password in **Settings → Account**; that also signs them out on their other phones and computers (so does **Sign out other devices**).
 
 ## 2b. Load your 2026 workbook (optional, once)
 
@@ -45,6 +47,8 @@ npm run seed:2026
 ```
 
 This adds January to September 2026 from the *2026 Income and Expense* workbook as nine month records: 862 transactions with their categories, the Split tab's splits for April to September, every paycheque, each month's budgets, the May 29 savings balances and your updated budget plan. Running it again puts those nine months back the way the workbook had them (weeks you added yourself aren't touched).
+
+The file, `seed/2026-workbook.sql`, holds real transactions, so it is kept out of git (`.gitignore`). Put your copy in `seed/` before running the command.
 
 ## 3. Deploy
 
@@ -137,13 +141,15 @@ For example, you could ask: *"Import this statement into this week as the Main c
 
 ## 8. Ask AI (optional)
 
-The **Ask AI** button opens a panel where you can ask about your money in plain words: *"What did we spend on groceries since June?"*, *"Which budgets did we go over in August?"*, *"Why is Paula's share higher this week?"* It reads the whole ledger (weeks, workbook months, categories, budgets, income, savings balances) with the same read-only lookups the MCP tools use. It can't change anything.
+The **Ask AI** button opens a panel where you can ask about your money in plain words: *"What did we spend on groceries since June?"*, *"Which budgets did we go over in August?"*, *"Why is Paula's share higher this week?"* It reads the whole ledger (weeks, workbook months, categories, budgets, income, savings balances) with the same read-only lookups the MCP tools use, and it knows which week or month you have open, so "this week" means the one on your screen. The answer appears as it's written; **Stop** ends it. It can't change anything.
 
 On this website it uses an Anthropic API key, billed to that key's account:
 
 1. Make a key at console.anthropic.com → API keys.
 2. `npx wrangler secret put ANTHROPIC_API_KEY`
-3. Optional: `npx wrangler secret put ANTHROPIC_MODEL` to pick another model (the default is `claude-sonnet-5-5`).
+3. Optional: `npx wrangler secret put ANTHROPIC_MODEL` to pick another model (the default is `claude-sonnet-5-5`), and `npx wrangler secret put ANTHROPIC_EFFORT` for how hard it thinks: `low`, `medium` (the default), `high`, `xhigh` or `max`.
+
+The ledger part of the prompt is cached between the lookups of one question, which keeps the cost down. If the model declines a question for safety reasons, the server can retry it on another model (the API's `fallbacks: "default"` option, turned on for Claude Sonnet 5.5, Opus 5, Opus 5.5 and Fable 5.1); if every model declines, the panel says so.
 
 Each person can ask up to 40 questions an hour. In the Claude version of the app, Ask AI uses the viewer's own Claude account instead and needs no key.
 
@@ -154,11 +160,15 @@ The website is an installable app: its own icon, full screen, no browser tabs.
 - **Android, Windows, Mac, ChromeOS (Chrome or Edge):** sign in, then click **Install app** at the top (or Settings → Use it as an app). You can also use the install icon in the address bar.
 - **iPhone / iPad:** open the site in Safari → **Share** → **Add to Home Screen**.
 
-The installed app has two shortcuts (long-press or right-click its icon): **2026 overview** and **Ask AI**. It opens even when you're offline, but your numbers always come live from the server.
+The installed app has two shortcuts (long-press or right-click its icon): **Year overview** and **Ask AI**. It opens even when you're offline, but your numbers always come live from the server. On a phone the week opens with what's owed and the transactions first; reports and totals follow below them.
+
+## 10. Backups
+
+**Settings → Backup → Download a backup** saves one JSON file with everything: settings, every week and month with its transactions, budgets, income and savings balances (no passwords or AI tokens). The Google Sheet is a second copy that updates itself.
 
 ## Working on it with Claude Code
 
-`CLAUDE.md` tells Claude Code how the project fits together, which rules to keep in sync (the money math lives in both `src/core.ts` and `public/index.html`), and how to check changes (`npm run typecheck`, `npm run smoke`). Open the repo in Claude Code and ask for what you want changed.
+`CLAUDE.md` tells Claude Code how the project fits together, which rules to keep in sync (the money math lives in both `src/core.ts` and `public/index.html`), and how to check changes (`npm run typecheck`, `npm test`, `npm run smoke`). Open the repo in Claude Code and ask for what you want changed.
 
 ## Local development
 
@@ -168,30 +178,33 @@ npm run db:migrate:local
 npm run user:add -- jam "Jam" --local
 npm run seed:2026:local                 # optional: the 2026 workbook months
 npm run dev                             # http://localhost:8787
+npm test                                # the money rules in src/core.ts and public/index.html must agree
 ```
+
+Pull requests run the type check and `npm test` (`.github/workflows/check.yml`).
 
 ## Files
 
 ```
 src/index.ts      routes: login, REST API, MCP, cron
-src/mcp.ts        MCP server (Streamable HTTP, stateless) and the 12 tools
+src/mcp.ts        MCP server (Streamable HTTP, stateless) and the 16 tools
 src/core.ts       ledger rules shared by API and MCP: splits, totals, duplicate checks, statement parsing
 src/db.ts         D1 access
 src/sync.ts       Google Sheets push and Notion sync
-src/ai.ts         Ask AI (Anthropic API with the read-only MCP tools)
+src/ai.ts         Ask AI (Anthropic SDK, streamed answers, the read-only MCP tools)
 src/auth.ts       PBKDF2 passwords, KV sessions, login rate limit
 public/index.html the app (same page that runs inside Claude; it switches to this server when opened here)
 public/sw.js, manifest.json, icons/   what makes it installable as an app
 CLAUDE.md         notes for Claude Code
 apps-script/Code.gs   receiver to paste into the Google Sheet
 migrations/       D1 schema
-seed/             the 2026 workbook history (npm run seed:2026)
-scripts/          setup, add-user, mcp-check, smoke (npm run smoke), build-artifact
+seed/             the 2026 workbook history (npm run seed:2026; the .sql file stays out of git)
+scripts/          setup, add-user, mcp-check, smoke (npm run smoke), build-artifact, parity-test (npm test)
 ```
 
 ## Good to know
 
 - **Sign-in:** sessions last 30 days. After 8 wrong passwords, that username is locked for 15 minutes from that network.
-- **Changes from an AI** show up in an open browser within about 20 seconds.
+- **Changes from an AI or the other person** show up in an open browser within about 20 seconds. Each save sends only what changed, so two people editing at once (one marks a week paid, the other fixes a note) don't undo each other.
 - **The Claude version** of the app keeps its own separate data. Pick one place to keep the real ledger. This website is the one that has the MCP endpoint and the Google Sheet sync.
 - **Workbook months** (January–September 2026) have no card, so they never create a transfer. January to March aren't split because the workbook's Split tab starts in April; you can split them in the app if you want.

@@ -86,6 +86,8 @@ export const dShort = (s: string | null) => { if (!s) return ''; const [, m, d] 
 export const money = (n: number) => new Intl.NumberFormat('en-CA', { style: 'currency', currency: 'CAD' }).format(r2(n));
 export const rid = (prefix = 'r') => prefix + crypto.randomUUID().replace(/-/g, '').slice(0, 10);
 export const todayISO = (tz = 'America/Edmonton') => new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
+/** This year in the household's time zone (the Worker's clock is UTC). */
+export const thisYear = (tz?: string) => +todayISO(tz).slice(0, 4);
 export function addDays(s: string, n: number) { const [y, m, d] = s.split('-').map(Number); const t = new Date(Date.UTC(y, m - 1, d + n)); return iso(t.getUTCFullYear(), t.getUTCMonth() + 1, t.getUTCDate()); }
 export function daysApart(a: string, b: string) {
   const [y1, m1, d1] = a.split('-').map(Number), [y2, m2, d2] = b.split('-').map(Number);
@@ -242,12 +244,22 @@ export function parseCSV(text: string): string[][] {
   if (f !== '' || row.length) { row.push(f); rows.push(row); }
   return rows.filter(r => r.some(x => String(x).trim() !== ''));
 }
-export function parseDate(raw: unknown): string | null {
+export type DateOrder = 'mdy' | 'dmy' | null;
+/** Day-first or month-first, decided once per file: any 25/10/2026 makes the whole file day-first. */
+export function dateOrder(values: unknown[]): DateOrder {
+  let mdy = 0, dmy = 0;
+  for (const v of values) {
+    const m = String(v ?? '').trim().match(/^(\d{1,2})[/.-](\d{1,2})[/.-](\d{2,4})$/); if (!m) continue;
+    if (+m[1] > 12 && +m[2] <= 12) dmy++; else if (+m[2] > 12 && +m[1] <= 12) mdy++;
+  }
+  return dmy > mdy ? 'dmy' : mdy ? 'mdy' : null;
+}
+export function parseDate(raw: unknown, order: DateOrder = null): string | null {
   const s = String(raw ?? '').trim(); let m: RegExpMatchArray | null;
   if ((m = s.match(/^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})/))) return iso(+m[1], +m[2], +m[3]);
-  if ((m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/))) {
+  if ((m = s.match(/^(\d{1,2})[/.-](\d{1,2})[/.-](\d{2,4})$/))) {
     let y = +m[3]; if (y < 100) y += 2000; let a = +m[1], b = +m[2];
-    if (a > 12 && b <= 12) [a, b] = [b, a];
+    if (order === 'dmy' || (!order && a > 12 && b <= 12)) [a, b] = [b, a];
     if (a < 1 || a > 12 || b < 1 || b > 31) return null;
     return iso(y, a, b);
   }
@@ -316,9 +328,10 @@ export function parseGrid(gridIn: unknown[][]): { rows: ParsedLine[]; error?: st
     if (map.date < 0 || map.desc < 0 || (map.amt < 0 && map.debit < 0)) map = guessMap(grid.slice(1));
   } else map = guessMap(grid);
   if (map.date < 0 || map.desc < 0 || (map.amt < 0 && map.debit < 0)) return { rows: [], error: 'Couldn’t find date, description and amount columns.' };
+  const order = dateOrder(grid.slice(start).map(r => r[map.date]));
   const out: ParsedLine[] = [];
   for (const line of grid.slice(start)) {
-    const date = parseDate(line[map.date]); if (!date) continue;
+    const date = parseDate(line[map.date], order); if (!date) continue;
     const desc = String(line[map.desc] ?? '').replace(/\s+/g, ' ').trim(); if (!desc) continue;
     let amt: number;
     if (map.amt >= 0) { const a = parseAmount(line[map.amt]); if (a === null) continue; amt = a; }
@@ -443,6 +456,67 @@ export function normalizeYear(raw: any, year: number): YearDoc {
   return doc;
 }
 
+/* Changes to a year are sent as small operations and applied to the latest saved
+   copy, so two people (or an AI) changing different things never undo each other.
+   Same function in the browser (applyYearOps in public/index.html). */
+export type YearOp =
+  | { op: 'budget'; mm: string; cat: string; v: number | null }
+  | { op: 'pct'; mm: string; g: Group; v: number | null }
+  | { op: 'budgetFrom'; mm: string; v: string | null }
+  | { op: 'month'; mm: string; budget: Record<string, number>; pct: Partial<Record<Group, number>>; budgetFrom?: string | null }
+  | { op: 'incomeAdd'; entry: IncomeEntry }
+  | { op: 'incomeDel'; id: string }
+  | { op: 'snap'; snap: Snapshot }
+  | { op: 'renameCat'; from: string; to: string };
+export function applyYearOps(doc: YearDoc, ops: unknown): YearDoc {
+  doc.months = doc.months || {}; doc.snapshots = doc.snapshots || [];
+  const month = (mm: string) => {
+    const m = doc.months[mm] || (doc.months[mm] = { budget: {}, income: [], pct: {}, saved: {} });
+    m.budget = m.budget || {}; m.income = m.income || []; m.pct = m.pct || {}; m.saved = m.saved || {};
+    return m;
+  };
+  const num = (v: unknown) => (v === null || v === undefined || v === '' || !isFinite(Number(v)) ? null : r2(v));
+  for (const o of (Array.isArray(ops) ? ops : []) as any[]) {
+    if (!o || typeof o !== 'object') continue;
+    const mmOk = MONTH_KEYS.includes(o.mm);
+    if (o.op === 'budget' && mmOk && typeof o.cat === 'string' && o.cat) {
+      const m = month(o.mm), v = num(o.v);
+      if (v === null) delete m.budget[o.cat]; else m.budget[o.cat] = v;
+      delete m.budgetFrom;
+    } else if (o.op === 'pct' && mmOk && GROUPS.some(g => g[0] === o.g)) {
+      const m = month(o.mm), v = num(o.v);
+      if (v === null) delete m.pct[o.g as Group]; else m.pct[o.g as Group] = Math.max(0, Math.min(100, Math.round(v * 10) / 10));
+    } else if (o.op === 'budgetFrom' && mmOk) {
+      const m = month(o.mm);
+      if (o.v) m.budgetFrom = String(o.v).slice(0, 80); else delete m.budgetFrom;
+    } else if (o.op === 'month' && mmOk) {
+      const m = month(o.mm);
+      m.budget = {}; m.pct = {};
+      for (const [k, v] of Object.entries(o.budget || {})) { const n = num(v); if (n !== null && k) m.budget[k] = n; }
+      for (const [g, v] of Object.entries(o.pct || {})) { const n = num(v); if (n !== null && GROUPS.some(x => x[0] === g)) m.pct[g as Group] = n; }
+      if (o.budgetFrom) m.budgetFrom = String(o.budgetFrom).slice(0, 80); else delete m.budgetFrom;
+    } else if (o.op === 'incomeAdd' && o.entry && typeof o.entry === 'object') {
+      const e = o.entry, mm = String(e.date || '').slice(5, 7), amt = num(e.amt);
+      if (!String(e.date || '').startsWith(doc.year + '-') || !MONTH_KEYS.includes(mm) || amt === null || !e.id) continue;
+      if (Object.values(doc.months).some(m => (m.income || []).some(i => i.id === e.id))) continue; // already there (a retried save)
+      month(mm).income.push({ id: String(e.id), date: e.date, source: String(e.source || 'Income'), who: e.who === 'p' || e.who === 'j' ? e.who : '', amt, note: String(e.note || '') });
+    } else if (o.op === 'incomeDel' && o.id) {
+      for (const m of Object.values(doc.months)) m.income = (m.income || []).filter(i => i.id !== o.id);
+    } else if (o.op === 'snap' && o.snap && /^\d{4}-\d{2}-\d{2}$/.test(String(o.snap.date))) {
+      doc.snapshots = doc.snapshots.filter(s => s.date !== o.snap.date).concat([o.snap]);
+    } else if (o.op === 'renameCat' && typeof o.from === 'string' && o.from && o.from !== o.to) {
+      for (const m of Object.values(doc.months)) {
+        for (const key of ['budget', 'saved'] as const) {
+          const map = m[key]; if (!map || !(o.from in map)) continue;
+          const v = map[o.from]; delete map[o.from];
+          if (o.to) map[o.to] = r2((map[o.to] || 0) + v); // merging into an existing category adds the amounts
+        }
+      }
+    }
+  }
+  return doc;
+}
+
 export interface MonthAgg { spent: number; n: number; cats: Record<string, number>; savedCats: Record<string, number>; p: number; j: number; un: number; unAmt: number; income: number; incP: number; incJ: number; incO: number; saved: number; budget: number }
 const blankAgg = (): MonthAgg => ({ spent: 0, n: 0, cats: {}, savedCats: {}, p: 0, j: 0, un: 0, unAmt: 0, income: 0, incP: 0, incJ: 0, incO: 0, saved: 0, budget: 0 });
 /** Same numbers as the app's year overview. Rows come with their week's salary ratio. */
@@ -459,7 +533,8 @@ export function yearAgg(rows: { row: Row; ratioP: number }[], doc: YearDoc, sett
   }
   for (const mm of MONTH_KEYS) {
     const md = doc.months[mm];
-    if (!md && !months[mm]) continue;
+    const has = md && (md.income.length || Object.keys(md.budget).length || Object.keys(md.saved).length);
+    if (!has && !months[mm]) continue;
     const m = M(mm);
     for (const i of md?.income || []) { m.income += i.amt; if (i.who === 'p') m.incP += i.amt; else if (i.who === 'j') m.incJ += i.amt; else m.incO += i.amt; }
     for (const [c, v] of Object.entries(m.cats)) if (catGroup(settings, c) === 'savings') m.saved += v;
